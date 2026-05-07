@@ -65,8 +65,11 @@ class GomisakuDB:
     def search(self, query: str) -> Optional[dict]:
         """Search for a garbage item by name.
 
-        Returns an item dict enriched with 'type_info', or None if not found.
-        Tries exact match first, then longest partial match (≥40 % overlap).
+        1. Exact match
+        2. Bigram-precision partial match (≥ 0.7)
+           バイグラム精度 = クエリのバイグラムのうち辞典品名に含まれる割合
+           これにより「インスタントラーメン容器」→「インスタントラーメン袋・容器」が
+           「インスタントラーメン（生ごみ）」より高スコアになる。
         """
         q = _norm(query)
         if not q:
@@ -77,32 +80,78 @@ class GomisakuDB:
             if _norm(item.get("name", "")) == q or _norm(item.get("name_reduced", "")) == q:
                 return self._enrich(item)
 
-        # 2. Partial match — pick the candidate with the highest overlap ratio
+        # 2. Bigram-precision partial match
+        result, score = self._best_bigram_match(q, threshold=0.7)
+        return self._enrich(result) if result else None
+
+    def get_suggestions(self, query: str, limit: int = 3) -> list[dict]:
+        """検索ゼロヒット時に近い品目を返す（バイグラム精度 ≥ 0.4）。
+        同じ分別種類の重複を避けて上位 limit 件を返す。"""
+        q = _norm(query)
+        if len(q) < 2:
+            return []
+
+        q_bigrams = frozenset(q[i:i + 2] for i in range(len(q) - 1))
+        scored: list[tuple[float, dict]] = []
+
+        for item in self.items:
+            score = self._precision(q_bigrams, item)
+            if score >= 0.4:
+                scored.append((score, item))
+
+        scored.sort(key=lambda x: -x[0])
+
+        seen_types: set[str] = set()
+        results: list[dict] = []
+        for _, item in scored:
+            tid = item.get("typeID", "")
+            if tid not in seen_types:
+                results.append(self._enrich(item))
+                seen_types.add(tid)
+            if len(results) >= limit:
+                break
+
+        return results
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _best_bigram_match(
+        self, q: str, threshold: float
+    ) -> tuple[Optional[dict], float]:
+        """クエリのバイグラム精度で全品目をスコアリングし最高スコアの品目を返す。"""
+        if len(q) < 2:
+            return None, 0.0
+
+        q_bigrams = frozenset(q[i:i + 2] for i in range(len(q) - 1))
         best_score = 0.0
         best_item: Optional[dict] = None
 
         for item in self.items:
-            name = _norm(item.get("name", ""))
-            name_r = _norm(item.get("name_reduced", ""))
-
-            score = 0.0
-            if name and q in name:
-                score = max(score, len(q) / len(name))
-            if name_r and q in name_r:
-                score = max(score, len(q) / len(name_r))
-            if name and name in q:
-                score = max(score, len(name) / len(q))
-            if name_r and name_r in q:
-                score = max(score, len(name_r) / len(q))
-
+            score = self._precision(q_bigrams, item)
             if score > best_score:
                 best_score = score
                 best_item = item
 
-        if best_item is not None and best_score >= 0.4:
-            return self._enrich(best_item)
+        if best_item is not None and best_score >= threshold:
+            return best_item, best_score
+        return None, best_score
 
-        return None
+    @staticmethod
+    def _precision(q_bigrams: frozenset, item: dict) -> float:
+        """クエリのバイグラムのうち品目名に含まれる割合（精度）を返す。"""
+        if not q_bigrams:
+            return 0.0
+        best = 0.0
+        for field in ("name", "name_reduced"):
+            n = _norm(item.get(field, ""))
+            if len(n) >= 2:
+                t_bigrams = frozenset(n[i:i + 2] for i in range(len(n) - 1))
+                precision = len(q_bigrams & t_bigrams) / len(q_bigrams)
+                if precision > best:
+                    best = precision
+        return best
 
     def _enrich(self, item: dict) -> dict:
         type_info = self.types.get(item.get("typeID", ""), {})

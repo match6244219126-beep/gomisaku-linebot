@@ -96,15 +96,16 @@ async def reply_message(reply_token: str, text: str) -> None:
 _VALID_MEDIA_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 
 _IDENTIFY_PROMPT = (
-    "画像に写っているゴミの品名を日本語で答えてください。\n"
-    "品名のみを1〜4語で簡潔に答えてください（例：ペットボトル、空き缶、新聞紙、乾電池）。\n"
-    "複数写っている場合は最も目立つ1品目だけ答えてください。\n"
+    "この画像に写っているゴミを日本のゴミ分別辞典で検索するための品名・検索ワードを、"
+    "カンマ区切りで最大5つ答えてください。\n"
+    "一般的な呼び名だけでなく、辞典に載っていそうな具体的な品目名も含めてください。\n"
+    "例）カップ麺の画像 → カップ麺容器, インスタントラーメン容器, 発泡スチロール容器, カップ麺, 容器\n"
     "ゴミが特定できない、またはゴミではない場合のみ「不明」と答えてください。"
 )
 
 
-async def identify_item(image_bytes: bytes, content_type: str) -> str:
-    """Ask Claude to name the garbage item in the image."""
+async def identify_item(image_bytes: bytes, content_type: str) -> list[str]:
+    """Ask Claude for multiple search-term candidates for the garbage item."""
     if content_type not in _VALID_MEDIA_TYPES:
         content_type = "image/jpeg"
 
@@ -112,7 +113,7 @@ async def identify_item(image_bytes: bytes, content_type: str) -> str:
 
     response = await claude.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=50,
+        max_tokens=100,
         messages=[{
             "role": "user",
             "content": [
@@ -128,28 +129,34 @@ async def identify_item(image_bytes: bytes, content_type: str) -> str:
             ],
         }],
     )
-    return response.content[0].text.strip()
+    raw = response.content[0].text.strip()
+    if raw == "不明" or not raw:
+        return []
+    # カンマ・読点・全角カンマで分割
+    import re as _re
+    candidates = [c.strip() for c in _re.split(r"[,、，]", raw) if c.strip()]
+    return candidates[:5]
 
 
 # ---------------------------------------------------------------------------
 # Response formatting
 # ---------------------------------------------------------------------------
 
-def format_result(item_name: str, result: Optional[dict]) -> str:
-    if result is None:
-        return (
-            f"「{item_name}」の分別情報が見つかりませんでした。\n\n"
-            f"品名を変えて再度お試しいただくか、\n"
-            f"直接お問い合わせください。\n{CONTACT_INFO}"
-        )
-
+def format_result(queried_name: str, result: dict) -> str:
+    """Format a found result. Shows a suggestion note when the matched name
+    differs from what the user (Claude) originally identified."""
     type_info = result.get("type_info", {})
     type_name = type_info.get("name", "不明")
     howto = type_info.get("howto", "").strip()
     comment = result.get("comment", "").strip()
-    display_name = result.get("name", item_name)
+    display_name = result.get("name", queried_name)
 
-    lines = [
+    lines = []
+    # 候補経由でヒットした場合（例：カップ麺→インスタントラーメン容器）に注記を追加
+    if display_name != queried_name:
+        lines.append(f"「{queried_name}」→「{display_name}」として分別情報をお伝えします\n")
+
+    lines += [
         f"【{display_name}】",
         f"▶ 分別: {type_name}",
     ]
@@ -158,6 +165,23 @@ def format_result(item_name: str, result: Optional[dict]) -> str:
     if comment:
         lines.append(f"\n⚠️ 注意: {comment}")
 
+    return "\n".join(lines)
+
+
+def format_not_found(queried_name: str, suggestions: list[dict]) -> str:
+    """Format a not-found response, optionally listing partial matches."""
+    if not suggestions:
+        return (
+            f"「{queried_name}」の分別情報が見つかりませんでした。\n\n"
+            f"品名を変えて再度お試しいただくか、\n"
+            f"直接お問い合わせください。\n{CONTACT_INFO}"
+        )
+
+    lines = [f"「{queried_name}」は辞典に見つかりませんでした。\n近い品目はこちらです：\n"]
+    for s in suggestions:
+        type_name = s.get("type_info", {}).get("name", "不明")
+        lines.append(f"・{s['name']}（{type_name}）")
+    lines.append(f"\n詳しくはお問い合わせください。\n{CONTACT_INFO}")
     return "\n".join(lines)
 
 
@@ -177,13 +201,28 @@ async def handle_event(event: dict) -> None:
         if msg_type == "image":
             message_id = message["id"]
             image_bytes, content_type = await get_line_image(message_id)
-            item_name = await identify_item(image_bytes, content_type)
+            candidates = await identify_item(image_bytes, content_type)
 
-            if not item_name or item_name == "不明":
+            if not candidates:
                 reply = "うまく判別できませんでした。\nゴミが写るように別の角度から撮り直してください📷"
             else:
-                result = db.search(item_name)
-                reply = format_result(item_name, result)
+                primary_name = candidates[0]  # Claudeが最初に挙げた名前
+                result = None
+                matched_candidate = None
+
+                # 候補を順番に検索し、最初にヒットしたものを使う
+                for candidate in candidates:
+                    result = db.search(candidate)
+                    if result:
+                        matched_candidate = candidate
+                        break
+
+                if result:
+                    reply = format_result(primary_name, result)
+                else:
+                    # どの候補もヒットしなければ近い品目を提案
+                    suggestions = db.get_suggestions(primary_name)
+                    reply = format_not_found(primary_name, suggestions)
 
             await reply_message(reply_token, reply)
 
